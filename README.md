@@ -18,6 +18,9 @@ Browser-based Go (Weiqi) client backed by a local [KataGo](https://github.com/li
 
 Large binaries and network weights are **not** included in this repo. Download them separately and keep them in your KataGo directory (default on Windows: `C:\katago`).
 
+**KataGo binary download URL:** https://github.com/lightvector/KataGo  
+(Releases page for prebuilt engines: https://github.com/lightvector/KataGo/releases)
+
 ## Quick start
 
 ```bash
