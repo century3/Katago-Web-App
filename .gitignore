@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# KataGo engine binaries & CUDA runtime (download separately)
+*.exe
+*.dll
+katago
+katago-v1.14.0-cuda12.1-cudnn8.9.7-windows-x64/
+*.zip
+
+# Neural network weights (hundreds of MB — download separately)
+*.bin.gz
+*.bin
+*.pt
+*.onnx
+
+# Logs & local runtime
+gtp_logs/
+gtp_log.txt
+*.log
+
+# Backups / local copies
+*.bak
+* - 副本.*
+* - 拷贝.*
+go_board - *.html
+board_recognizer.tar
+curl
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,26 @@
+{
+  "name": "katago-web-server",
+  "version": "1.0.0",
+  "description": "Web server that exposes KataGo GTP engine over HTTP",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": [
+    "katago",
+    "go",
+    "gtp",
+    "baduk"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "http-proxy-middleware": "^3.0.5"
+  }
+}
