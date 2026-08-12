@@ -1180,6 +1180,12 @@
         let gameMode = 'ai';
         let currentTurn = 'B';
         let moveHistory = [];
+        /**
+         * 图片识别得到的「开局摆子」基底（不进 moveHistory）。
+         * 续弈后的 play 才进 moveHistory；悔棋/还原重建时必须先摆回这些子。
+         * @type {Array<{x:number,y:number,color:string}>}
+         */
+        let setupPositionStones = [];
         let isGameActive = false;
         let lastMoveStone = null;
         let boardWidth, boardHeight;
@@ -2686,7 +2692,7 @@
             });
         }        
 
-        // 绘制所有棋子（盘上数字：当前剩余棋子按历史手顺排成 1…n；识别摆子无手数则不标号）
+        // 绘制所有棋子（手数：moveNumber>0；识别摆子基底不标号）
         function drawStones() {
             const showNums = moveHistory.length > 0;
             const sorted = [...stones].sort((a, b) => {
@@ -2696,8 +2702,10 @@
                 if (a.y !== b.y) return a.y - b.y;
                 return a.x - b.x;
             });
-            sorted.forEach((stone, i) => {
-                drawStone(stone.x, stone.y, stone.color, showNums ? i + 1 : null);
+            sorted.forEach((stone) => {
+                const num =
+                    showNums && Number(stone.moveNumber) > 0 ? Number(stone.moveNumber) : null;
+                drawStone(stone.x, stone.y, stone.color, num);
             });
         }
 
@@ -2889,15 +2897,26 @@
         }
 
         /**
-         * 根据 moveHistory 重新计算本地棋盘与提子数。
-         * 解决连续悔棋时仅 pop 最后一手导致“被提掉棋子未恢复”的状态漂移问题。
+         * 根据 setupPositionStones（识别基底）+ moveHistory 重新计算本地棋盘与提子数。
+         * 解决连续悔棋时仅 pop 最后一手导致“被提掉棋子未恢复”的状态漂移问题；
+         * 也修复识别续弈后 rebuild 丢掉摆子基底、局面变乱。
          */
         function rebuildBoardStateFromHistory() {
             const rebuiltStones = [];
             const rebuiltCaptured = { B: 0, W: 0 };
             let ply = 0;
 
-            if (gameHandicap >= 2 && handicapPlacements.length > 0) {
+            if (setupPositionStones.length > 0) {
+                for (const s of setupPositionStones) {
+                    rebuiltStones.push({
+                        x: s.x,
+                        y: s.y,
+                        color: s.color,
+                        moveNumber: 0,
+                        isSetup: true
+                    });
+                }
+            } else if (gameHandicap >= 2 && handicapPlacements.length > 0) {
                 for (let i = 0; i < handicapPlacements.length; i++) {
                     const p = handicapPlacements[i];
                     ply++;
@@ -2937,7 +2956,23 @@
 
             stones = rebuiltStones;
             capturedStones = rebuiltCaptured;
-            lastMoveStone = stones.length > 0 ? stones[stones.length - 1] : null;
+            if (moveHistory.length === 0) {
+                lastMoveStone = null;
+            } else {
+                const last = moveHistory[moveHistory.length - 1];
+                lastMoveStone =
+                    stones.find((s) => s.x === last.x && s.y === last.y && s.color === last.color) || null;
+            }
+        }
+
+        function setupPositionToResyncMoves() {
+            return setupPositionStones
+                .map((s) => {
+                    const coord = indexToCoordinate(s.x, s.y);
+                    if (!coord || coord === 'PASS') return null;
+                    return { color: s.color, coord };
+                })
+                .filter(Boolean);
         }
         
         // 检查自杀规则
@@ -3757,13 +3792,30 @@
         }
 
         /**
-         * 用当前手顺重建 GTP 局面（单次 HTTP 批量执行 clear + 让子 + play）。
+         * 用当前手顺重建 GTP 局面（单次 HTTP 批量执行）。
+         * 若有识别摆子基底：set_position(setup) + play(后续手)；否则 clear + 让子 + play。
          * @param {Array<{x:number,y:number,color:string}>} historySnapshot
          */
         async function resyncKataGoEngineFromMoves(historySnapshot) {
             try {
-                handicapPlacements = [];
                 const moves = historySnapshotToResyncMoves(historySnapshot);
+                if (setupPositionStones.length > 0) {
+                    handicapPlacements = [];
+                    const r = await sendGtpBatchRequest(
+                        {
+                            resyncBoard: {
+                                handicap: 0,
+                                setupStones: setupPositionToResyncMoves(),
+                                moves
+                            }
+                        },
+                        '同步引擎(识别基底+手顺)',
+                        Math.max(GTP_BATCH_SYNC_TIMEOUT_MS, 45000 + moves.length * 800)
+                    );
+                    return !!(r.ok && r.data && r.data.success === true);
+                }
+
+                handicapPlacements = [];
                 const handicap =
                     gameHandicap >= 2 && gameHandicap <= 9 ? gameHandicap : 0;
                 const r = await sendGtpBatchRequest(
@@ -4305,10 +4357,12 @@
             clearRedoStack();
 
             // 识别结果是「盘面」不是合法手顺：不要塞进 moveHistory，否则引擎按 play 重放会卡死/失败
+            setupPositionStones = clean.map((s) => ({ x: s.x, y: s.y, color: s.color }));
             stones = clean.map((s) => ({
                 ...s,
                 moveNumber: 0,
-                kataWinrateRecorded: false
+                kataWinrateRecorded: false,
+                isSetup: true
             }));
             moveHistory = [];
             lastMoveStone = null;
@@ -4436,6 +4490,7 @@
             return {
                 stones: stones.map((s) => ({ ...s })),
                 moveHistory: moveHistory.map((m) => ({ ...m })),
+                setupPositionStones: setupPositionStones.map((s) => ({ ...s })),
                 lastMoveStone: lastMoveStone ? { ...lastMoveStone } : null,
                 capturedStones: { ...capturedStones },
                 currentTurn,
@@ -4453,6 +4508,9 @@
             hideHumanMoveConfirmBar();
             stones = snapshot.stones.map((s) => ({ ...s }));
             moveHistory = snapshot.moveHistory.map((m) => ({ ...m }));
+            if (Array.isArray(snapshot.setupPositionStones)) {
+                setupPositionStones = snapshot.setupPositionStones.map((s) => ({ ...s }));
+            }
             lastMoveStone = snapshot.lastMoveStone ? { ...snapshot.lastMoveStone } : null;
             capturedStones = { ...snapshot.capturedStones };
             currentTurn = snapshot.currentTurn;
@@ -4473,6 +4531,7 @@
         function clearBoardForRecognitionPreview() {
             stones = [];
             moveHistory = [];
+            setupPositionStones = [];
             lastMoveStone = null;
             capturedStones = { B: 0, W: 0 };
             gameHandicap = 0;
@@ -5207,6 +5266,7 @@
             clearRedoStack();
             stones = [];
             moveHistory = [];
+            setupPositionStones = [];
             lastMoveStone = null;
             capturedStones = { B: 0, W: 0 };
 
@@ -5272,6 +5332,7 @@
             clearRedoStack();
             stones = [];
             moveHistory = [];
+            setupPositionStones = [];
             lastMoveStone = null;
             capturedStones = { B: 0, W: 0 };
             gameHandicap = 0;

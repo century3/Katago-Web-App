@@ -891,9 +891,10 @@ class SessionReplayCoordinator {
     /**
      * 单次 HTTP 内重建局面。
      * - 默认：clear_board + 让子 + 按手数 play（悔棋/SGF 手顺）
-     * - payload.setPosition=true：clear_board + set_position（图片识别等「只有盘面、没有合法手顺」）
+     * - payload.setPosition=true：clear_board + set_position（仅摆子，moves 为棋子列表）
+     * - payload.setupStones：先 set_position 基底，再 play moves（识别续弈后的悔棋/还原）
      * @param {string} sid
-     * @param {{ handicap?: number, moves?: Array<{color:string,coord:string}>, setPosition?: boolean }} payload
+     * @param {{ handicap?: number, moves?: Array<{color:string,coord:string}>, setPosition?: boolean, setupStones?: Array<{color:string,coord:string}> }} payload
      */
     async resyncBoardInPlace(sid, payload) {
         const { state } = this.getSessionState(sid);
@@ -905,12 +906,13 @@ class SessionReplayCoordinator {
             throw new Error('clear_board 失败');
         }
 
-        const useSetPosition = !!(payload && payload.setPosition);
         const moves = Array.isArray(payload && payload.moves) ? payload.moves : [];
+        const setupStones = Array.isArray(payload && payload.setupStones) ? payload.setupStones : null;
+        const useSetPositionOnly = !!(payload && payload.setPosition) && setupStones === null;
 
-        if (useSetPosition) {
+        const buildSetPositionCmd = (stoneList) => {
             const parts = ['set_position'];
-            for (const m of moves) {
+            for (const m of stoneList) {
                 const color = normalizeGtpColorToken(m && m.color);
                 if (!color) continue;
                 let coord = String((m && m.coord) || '').trim();
@@ -918,6 +920,46 @@ class SessionReplayCoordinator {
                 if (coord.toUpperCase() === 'PASS') continue;
                 parts.push(color, coord);
             }
+            return parts;
+        };
+
+        if (setupStones !== null) {
+            const parts = buildSetPositionCmd(setupStones);
+            const spCmd = parts.join(' ');
+            const spR = await this.engine.send(spCmd, GTP_RESYNC_CMD_TIMEOUT_MS);
+            if (!gtpEngineResultLooksSuccessful(spR)) {
+                throw new Error(
+                    `set_position 失败（可能有无气死子或重复坐标）: ${String(spR || '').trim().slice(0, 200)}`
+                );
+            }
+            newCommands.push(spCmd);
+
+            for (const m of moves) {
+                const color = normalizeGtpColorToken(m && m.color);
+                if (!color) continue;
+                let coord = String((m && m.coord) || '').trim();
+                if (!coord) continue;
+                if (coord.toUpperCase() === 'PASS') coord = 'pass';
+                const cmd = `play ${color} ${coord}`;
+                const pr = await this.engine.send(cmd, GTP_RESYNC_CMD_TIMEOUT_MS);
+                if (!gtpEngineResultLooksSuccessful(pr)) {
+                    throw new Error(`同步失败: ${cmd}`);
+                }
+                newCommands.push(cmd);
+            }
+
+            state.commands = newCommands;
+            this.activeSessionId = sid;
+            return {
+                playPly: countSessionPlayCommands(newCommands),
+                fixedHandicapResult: null,
+                setPosition: true,
+                stoneCount: Math.max(0, Math.floor((parts.length - 1) / 2))
+            };
+        }
+
+        if (useSetPositionOnly) {
+            const parts = buildSetPositionCmd(moves);
             const spCmd = parts.join(' ');
             const spR = await this.engine.send(spCmd, GTP_RESYNC_CMD_TIMEOUT_MS);
             if (!gtpEngineResultLooksSuccessful(spR)) {
@@ -1553,16 +1595,19 @@ class KataGoReplayServer {
                             const handicap = parseInt(rb.handicap, 10) || 0;
                             const moves = Array.isArray(rb.moves) ? rb.moves : [];
                             const setPosition = !!rb.setPosition;
+                            const setupStones = Array.isArray(rb.setupStones) ? rb.setupStones : null;
                             const out = await this.enginePool.handleResyncBoard(
                                 sid,
-                                { handicap, moves, setPosition },
+                                { handicap, moves, setPosition, setupStones },
                                 modelBasename
                             );
                             const sidShort = sid.length > 14 ? `${sid.slice(0, 14)}…` : sid;
                             console.log(
-                                setPosition
-                                    ? `[HTTP] 棋局[${sidShort}] set_position 摆子 ${out.stoneCount || moves.length} 枚`
-                                    : `[HTTP] 棋局[${sidShort}] 批量同步 ${moves.length} 手 play | handicap=${handicap}`
+                                setupStones !== null
+                                    ? `[HTTP] 棋局[${sidShort}] setup+play 同步 setup=${setupStones.length} play=${moves.length}`
+                                    : setPosition
+                                      ? `[HTTP] 棋局[${sidShort}] set_position 摆子 ${out.stoneCount || moves.length} 枚`
+                                      : `[HTTP] 棋局[${sidShort}] 批量同步 ${moves.length} 手 play | handicap=${handicap}`
                             );
                             res.writeHead(200, { 'Content-Type': 'application/json' });
                             res.end(
