@@ -850,9 +850,9 @@
         let katagoAnalyzeVisits = (() => {
             if (katagoVisitsLockedByUrl) {
                 const v = parseInt(urlParams.get('katagoVisits'), 10);
-                return Number.isFinite(v) ? Math.max(15, Math.min(5000, v)) : 1000;
+                return Number.isFinite(v) ? Math.max(15, Math.min(8000, v)) : 2000;
             }
-            return 1000;
+            return 2000;
         })();
         /** AI 落子是否请求 ownership（true 更慢；目数可用「计算目数」）?katagoOwnership=1 开启 */
         const katagoAiOwnership = urlParams.get('katagoOwnership') === '1';
@@ -1107,7 +1107,7 @@
             if (!katagoVisitsLockedByUrl && hj.katagoDefaultVisits != null) {
                 const dv = parseInt(hj.katagoDefaultVisits, 10);
                 if (Number.isFinite(dv)) {
-                    katagoAnalyzeVisits = Math.max(15, Math.min(5000, dv));
+                    katagoAnalyzeVisits = Math.max(15, Math.min(8000, dv));
                 }
             }
 
@@ -2686,8 +2686,9 @@
             });
         }        
 
-        // 绘制所有棋子（盘上数字：当前剩余棋子按历史手顺排成 1…n，与是否提过子无关）
+        // 绘制所有棋子（盘上数字：当前剩余棋子按历史手顺排成 1…n；识别摆子无手数则不标号）
         function drawStones() {
+            const showNums = moveHistory.length > 0;
             const sorted = [...stones].sort((a, b) => {
                 const na = Number(a.moveNumber) > 0 ? Number(a.moveNumber) : 1e9;
                 const nb = Number(b.moveNumber) > 0 ? Number(b.moveNumber) : 1e9;
@@ -2696,7 +2697,7 @@
                 return a.x - b.x;
             });
             sorted.forEach((stone, i) => {
-                drawStone(stone.x, stone.y, stone.color, i + 1);
+                drawStone(stone.x, stone.y, stone.color, showNums ? i + 1 : null);
             });
         }
 
@@ -2998,7 +2999,7 @@
             const colLetters = 'ABCDEFGHJKLMNOPQRST';
             const colChar = colLetters.charAt(x);
             
-            const row = 19 - y;
+            const row = boardSize - y;
             
             return `${colChar}${row}`;
         }
@@ -4303,13 +4304,14 @@
             handicapPlacements = [];
             clearRedoStack();
 
-            stones = clean.map((s, i) => ({
+            // 识别结果是「盘面」不是合法手顺：不要塞进 moveHistory，否则引擎按 play 重放会卡死/失败
+            stones = clean.map((s) => ({
                 ...s,
-                moveNumber: i + 1,
+                moveNumber: 0,
                 kataWinrateRecorded: false
             }));
-            moveHistory = stones.map((s) => ({ ...s }));
-            lastMoveStone = stones.length > 0 ? stones[stones.length - 1] : null;
+            moveHistory = [];
+            lastMoveStone = null;
             capturedStones = { B: 0, W: 0 };
             currentTurn = inferTurnByStoneCount(stones);
             isGameActive = true;
@@ -4330,8 +4332,50 @@
             btn.style.display = visible ? '' : 'none';
         }
 
+        /**
+         * 图片识别后：用 GTP set_position 整盘摆子（不要按假手顺 play）。
+         */
+        async function syncEngineToRecognizedPosition(stoneList) {
+            const list = Array.isArray(stoneList) ? stoneList : stones;
+            const moves = [];
+            for (const s of list) {
+                if (!s) continue;
+                const color = String(s.color || '').toUpperCase();
+                if (color !== 'B' && color !== 'W') continue;
+                const coord = indexToCoordinate(s.x, s.y);
+                if (!coord || coord === 'PASS') continue;
+                moves.push({ color, coord });
+            }
+            engineStateSyncInProgress = true;
+            updateStatus();
+            try {
+                const doSync = async () => {
+                    const r = await sendGtpBatchRequest(
+                        { resyncBoard: { setPosition: true, handicap: 0, moves } },
+                        '识别局面同步(set_position)',
+                        Math.max(GTP_BATCH_SYNC_TIMEOUT_MS, 45000)
+                    );
+                    return !!(r.ok && r.data && r.data.success === true);
+                };
+                resyncEngineTail = resyncEngineTail.then(doSync);
+                const ok = await resyncEngineTail;
+                if (!ok) {
+                    addLog('识别', '引擎 set_position 同步失败，继续走棋可能不准', 'error');
+                } else {
+                    addLog('识别', `引擎已 set_position 摆子 ${moves.length} 枚`, 'received');
+                }
+                return ok;
+            } catch (error) {
+                addLog('识别', `已显示图片局面，但同步引擎失败：${error.message}`, 'error');
+                return false;
+            } finally {
+                engineStateSyncInProgress = false;
+                updateStatus();
+            }
+        }
+
         async function syncEngineToCurrentBoard() {
-            // 关键：识别后必须把同一盘面同步到 KataGo 引擎，否则“推荐选点/分析”会基于旧局面
+            // 普通手顺同步（悔棋/SGF 等）；识别局面请用 syncEngineToRecognizedPosition
             const historySnapshot = moveHistory.map((m) => ({ x: m.x, y: m.y, color: m.color }));
             engineStateSyncInProgress = true;
             updateStatus();
@@ -4348,7 +4392,7 @@
 
         async function applyRecognizedBoardStones(stoneList) {
             renderRecognizedBoardStones(stoneList);
-            await syncEngineToCurrentBoard();
+            await syncEngineToRecognizedPosition(stones);
             setContinuePositionButtonVisible(true);
 
             addLog('识别', `已还原棋局并同步引擎：黑 ${stones.filter(s => s.color === 'B').length} 子，白 ${stones.filter(s => s.color === 'W').length} 子`);
@@ -4360,16 +4404,27 @@
                 alert('当前棋盘没有可继续的局面');
                 return;
             }
+            if (engineStateSyncInProgress) {
+                addLog('游戏', '引擎仍在同步局面，请稍候再点继续', 'error');
+                return;
+            }
             isGameActive = true;
             updateStatus();
             drawBoard();
             setContinuePositionButtonVisible(false);
 
-            addLog('游戏', `从当前局面继续对局，轮到${currentTurn === 'B' ? '黑' : '白'}方`);
+            const turnLabel = currentTurn === 'B' ? '黑' : '白';
+            addLog('游戏', `从当前局面继续对局，轮到${turnLabel}方`, 'received');
             if (gameMode === 'ai' && currentTurn === katagoColor) {
-                setTimeout(() => {
-                    requestKataGoMove();
-                }, 300);
+                maybeRequestKataGoMoveIfItsTurn('正在思考…');
+            } else if (gameMode === 'ai') {
+                addLog(
+                    '游戏',
+                    `请在棋盘上落${turnLabel}子；若要让 KataGo 执${turnLabel}，先点上方「KataGo 执${turnLabel}」再等它自动思考`,
+                    'received'
+                );
+            } else {
+                addLog('游戏', '请在棋盘上落子继续', 'received');
             }
         }
 
@@ -5350,16 +5405,32 @@
             }
         }
 
+        function maybeRequestKataGoMoveIfItsTurn(reason) {
+            if (gameMode !== 'ai') return;
+            if (!isGameActive) return;
+            if (engineStateSyncInProgress) return;
+            if (allowHumanPlayForKatago) return;
+            if (katagoGenmoveBusy) return;
+            if (currentTurn !== katagoColor) return;
+            addLog('KataGo', reason || '轮到引擎落子，开始思考…', 'sent');
+            setTimeout(() => {
+                requestKataGoMove();
+            }, 200);
+        }
+
         function setKataGoColor(color) {
             if (gameMode !== 'ai') return;
-            katagoColor = color;
-            humanColor = color === 'B' ? 'W' : 'B';
+            const next = color === 'B' ? 'B' : 'W';
+            katagoColor = next;
+            humanColor = next === 'B' ? 'W' : 'B';
             
             document.getElementById('katago-color').textContent = 
-                `${color === 'B' ? '黑色 (B)' : '白色 (W)'}`;
+                `${next === 'B' ? '黑色 (B)' : '白色 (W)'}`;
             
-            addLog('设置', `KataGo 执${color === 'B' ? '黑' : '白'}，人类执${humanColor === 'B' ? '黑' : '白'}`);
+            addLog('设置', `KataGo 执${next === 'B' ? '黑' : '白'}，人类执${humanColor === 'B' ? '黑' : '白'}`);
             updateStatus();
+            // 识别续弈后常改执子颜色：若改完正好轮到引擎，必须立刻触发思考，否则棋盘点击会被拦住且无人落子
+            maybeRequestKataGoMoveIfItsTurn('执子颜色已切换，轮到 KataGo，开始思考…');
         }
 
         async function sendCommand() {

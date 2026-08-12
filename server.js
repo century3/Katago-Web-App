@@ -8,12 +8,11 @@ const { Buffer } = require('buffer');
 const HTTP_PORT = process.env.HTTP_PORT ? parseInt(process.env.HTTP_PORT, 10) : 5001;
 
 /**
- * 棋盘识别：Python `board_recognizer.py`（Roboflow 云端 + 传统 CV + 可选本地 Ultralytics）。
- * - Roboflow：`ROBOFLOW_API_KEY`、`BOARD_ROBOFLOW_MODEL_ENDPOINT`（勿把密钥写入仓库）。
- * - 本地 YOLO（不依赖 Roboflow）：`BOARD_DL_MODEL` 指向 .pt/.onnx；仅黑白检测的权重配合
- *   `BOARD_DL_HAS_BOARD_CLASS=0` 与 `BOARD_DL_CLASS_MAP`；四角默认用脚本内传统搜索结果
- *  （`BOARD_DL_USE_TRADITIONAL_QUAD=1`）。若 Roboflow 常失败可先试本地：`BOARD_LOCAL_DL_BEFORE_ROBOFLOW=1`。
- * 开源参考见 `board_recognizer.py` 中 `_try_ultralytics_go_recognition` 文档字符串。
+ * 棋盘识别：默认 Python `board_recognizer_gbd.py`（go-board-detect：moku-v1 + OpenCV）。
+ * - 切换旧版：`BOARD_RECOGNIZER=legacy` → `board_recognizer.py`（Roboflow / 传统 CV / Ultralytics）。
+ * - go-board-detect：`GO_BOARD_DETECT_DIR`、`MOKU_MODEL_DIR`、`BOARD_GBD_CONF`、`BOARD_GBD_DEVICE`。
+ * - 旧版 Roboflow：`ROBOFLOW_API_KEY`、`BOARD_ROBOFLOW_MODEL_ENDPOINT`（勿把密钥写入仓库）。
+ * - 旧版本地 YOLO：`BOARD_DL_MODEL`；可设 `BOARD_LOCAL_DL_BEFORE_ROBOFLOW=1`。
  */
 const ROBOFLOW_MODEL_ENDPOINT_DEFAULT = 'synthetic-data-3ol2y/go-positions/model/6';
 const RECOGNIZE_JOB_TTL_MS = 30 * 60 * 1000;
@@ -88,8 +87,8 @@ const KATAGO_MODEL =
 
 /** 人机每手 kata-genmove_analyze 默认访问次数（网页 ?katagoVisits= 可覆盖；亦可通过本环境变量调整） */
 const KATAGO_DEFAULT_VISITS = (() => {
-    const v = parseInt(String(process.env.KATAGO_DEFAULT_VISITS || '1000').trim(), 10);
-    return Number.isFinite(v) ? Math.max(15, Math.min(5000, v)) : 1000;
+    const v = parseInt(String(process.env.KATAGO_DEFAULT_VISITS || '2000').trim(), 10);
+    return Number.isFinite(v) ? Math.max(15, Math.min(8000, v)) : 2000;
 })();
 
 /** 从 GTP 配置文件读取与棋力相关的项，供 /health 展示 */
@@ -455,12 +454,81 @@ function applyBoardRecognizeFastDefaults(env) {
     setIfUnset('BOARD_ROBOFLOW_JPEG_QUALITY', '82');
 }
 
+/** 默认 go-board-detect；BOARD_RECOGNIZER=legacy|roboflow|old 时用旧脚本。 */
+function resolveBoardRecognizerScript() {
+    const backend = String(process.env.BOARD_RECOGNIZER || 'gbd').trim().toLowerCase();
+    const legacy = path.join(__dirname, 'board_recognizer.py');
+    const gbd = path.join(__dirname, 'board_recognizer_gbd.py');
+    if (backend === 'legacy' || backend === 'roboflow' || backend === 'old') {
+        return legacy;
+    }
+    if (backend === 'gbd' || backend === 'moku' || backend === 'go-board-detect') {
+        if (!fs.existsSync(gbd)) {
+            console.warn('[board-recognize] board_recognizer_gbd.py 不存在，回退 legacy');
+            return legacy;
+        }
+        return gbd;
+    }
+    // 未识别的取值：有 gbd 脚本则优先
+    if (fs.existsSync(gbd)) return gbd;
+    return legacy;
+}
+
+/** 从可能混有日志的 stdout 中提取 JSON 对象。 */
+function parseRecognizerStdout(stdout) {
+    const text = String(stdout || '').trim();
+    if (!text) return {};
+    try {
+        return JSON.parse(text);
+    } catch (_) {}
+    const start = text.lastIndexOf('{');
+    if (start < 0) {
+        throw new Error('识别输出中无 JSON 对象');
+    }
+    // 从最后一个 { 起尝试平衡括号截取
+    let depth = 0;
+    let end = -1;
+    for (let i = start; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '{') depth++;
+        else if (ch === '}') {
+            depth--;
+            if (depth === 0) {
+                end = i;
+                break;
+            }
+        }
+    }
+    if (end < 0) {
+        throw new Error('识别输出 JSON 不完整');
+    }
+    return JSON.parse(text.slice(start, end + 1));
+}
+
 function runBoardRecognizer(imageBuffer, manualQuad = null, previewOnly = false, options = {}) {
     return new Promise((resolve, reject) => {
-        const scriptPath = path.join(__dirname, 'board_recognizer.py');
+        const scriptPath = resolveBoardRecognizerScript();
+        const usingGbd = path.basename(scriptPath) === 'board_recognizer_gbd.py';
+        console.log(`[board-recognize] backend=${usingGbd ? 'gbd(go-board-detect)' : 'legacy'} script=${scriptPath}`);
         const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
         const env = { ...process.env };
-        applyBoardRecognizeFastDefaults(env);
+        if (!usingGbd) {
+            applyBoardRecognizeFastDefaults(env);
+        } else {
+            if (!stripWrappedEnvQuotes(env.GO_BOARD_DETECT_DIR)) {
+                const defaultGbd = 'D:\\AI-AGent-Learning\\go-board-detect';
+                if (fs.existsSync(path.join(defaultGbd, '6-yolo-go-to-sgf.py'))) {
+                    env.GO_BOARD_DETECT_DIR = defaultGbd;
+                }
+            }
+            if (!stripWrappedEnvQuotes(env.MOKU_MODEL_DIR)) {
+                const defaultMoku =
+                    'D:\\AI-AGent-Learning\\11-Pytorch与视觉检测\\yolo-cases\\models\\moku-v1';
+                if (fs.existsSync(path.join(defaultMoku, 'model.safetensors'))) {
+                    env.MOKU_MODEL_DIR = defaultMoku;
+                }
+            }
+        }
         const fastRemoteMode = !!options.fastRemoteMode && !previewOnly;
         const rfKey = stripWrappedEnvQuotes(process.env.ROBOFLOW_API_KEY);
         if (rfKey) {
@@ -530,7 +598,7 @@ function runBoardRecognizer(imageBuffer, manualQuad = null, previewOnly = false,
                 return;
             }
             try {
-                const parsed = JSON.parse(stdout || '{}');
+                const parsed = parseRecognizerStdout(stdout);
                 resolve(parsed);
             } catch (err) {
                 reject(new Error(`识别输出解析失败: ${err.message}`));
@@ -784,6 +852,11 @@ class SessionReplayCoordinator {
             if (gtpEngineResultLooksSuccessful(result)) state.commands = [text];
             return;
         }
+        if (low.startsWith('set_position')) {
+            // 整盘摆子：无手数历史；会话只保留这一条（后续 play 叠在其后）
+            if (gtpEngineResultLooksSuccessful(result)) state.commands = [text];
+            return;
+        }
         if (low.startsWith('play ')) {
             if (gtpEngineResultLooksSuccessful(result)) state.commands.push(text);
             return;
@@ -816,9 +889,11 @@ class SessionReplayCoordinator {
     }
 
     /**
-     * 单次 HTTP 内完成 clear_board + 让子 + 全部 play，避免悔棋/还原时 N 次往返。
+     * 单次 HTTP 内重建局面。
+     * - 默认：clear_board + 让子 + 按手数 play（悔棋/SGF 手顺）
+     * - payload.setPosition=true：clear_board + set_position（图片识别等「只有盘面、没有合法手顺」）
      * @param {string} sid
-     * @param {{ handicap?: number, moves?: Array<{color:string,coord:string}> }} payload
+     * @param {{ handicap?: number, moves?: Array<{color:string,coord:string}>, setPosition?: boolean }} payload
      */
     async resyncBoardInPlace(sid, payload) {
         const { state } = this.getSessionState(sid);
@@ -828,6 +903,37 @@ class SessionReplayCoordinator {
         const clearR = await this.engine.send('clear_board', GTP_RESYNC_CMD_TIMEOUT_MS);
         if (!gtpEngineResultLooksSuccessful(clearR)) {
             throw new Error('clear_board 失败');
+        }
+
+        const useSetPosition = !!(payload && payload.setPosition);
+        const moves = Array.isArray(payload && payload.moves) ? payload.moves : [];
+
+        if (useSetPosition) {
+            const parts = ['set_position'];
+            for (const m of moves) {
+                const color = normalizeGtpColorToken(m && m.color);
+                if (!color) continue;
+                let coord = String((m && m.coord) || '').trim();
+                if (!coord) continue;
+                if (coord.toUpperCase() === 'PASS') continue;
+                parts.push(color, coord);
+            }
+            const spCmd = parts.join(' ');
+            const spR = await this.engine.send(spCmd, GTP_RESYNC_CMD_TIMEOUT_MS);
+            if (!gtpEngineResultLooksSuccessful(spR)) {
+                throw new Error(
+                    `set_position 失败（可能有无气死子或重复坐标）: ${String(spR || '').trim().slice(0, 200)}`
+                );
+            }
+            newCommands.push(spCmd);
+            state.commands = newCommands;
+            this.activeSessionId = sid;
+            return {
+                playPly: 0,
+                fixedHandicapResult: null,
+                setPosition: true,
+                stoneCount: Math.max(0, Math.floor((parts.length - 1) / 2))
+            };
         }
 
         const handicap = parseInt(payload && payload.handicap, 10) || 0;
@@ -842,7 +948,6 @@ class SessionReplayCoordinator {
             fixedHandicapResult = fhR;
         }
 
-        const moves = Array.isArray(payload && payload.moves) ? payload.moves : [];
         for (const m of moves) {
             const color = normalizeGtpColorToken(m && m.color);
             if (!color) continue;
@@ -1447,21 +1552,26 @@ class KataGoReplayServer {
                             const rb = data.resyncBoard;
                             const handicap = parseInt(rb.handicap, 10) || 0;
                             const moves = Array.isArray(rb.moves) ? rb.moves : [];
+                            const setPosition = !!rb.setPosition;
                             const out = await this.enginePool.handleResyncBoard(
                                 sid,
-                                { handicap, moves },
+                                { handicap, moves, setPosition },
                                 modelBasename
                             );
                             const sidShort = sid.length > 14 ? `${sid.slice(0, 14)}…` : sid;
                             console.log(
-                                `[HTTP] 棋局[${sidShort}] 批量同步 ${moves.length} 手 play | handicap=${handicap}`
+                                setPosition
+                                    ? `[HTTP] 棋局[${sidShort}] set_position 摆子 ${out.stoneCount || moves.length} 枚`
+                                    : `[HTTP] 棋局[${sidShort}] 批量同步 ${moves.length} 手 play | handicap=${handicap}`
                             );
                             res.writeHead(200, { 'Content-Type': 'application/json' });
                             res.end(
                                 JSON.stringify({
                                     success: true,
                                     playPly: out.playPly,
-                                    fixedHandicapResult: out.fixedHandicapResult || null
+                                    fixedHandicapResult: out.fixedHandicapResult || null,
+                                    setPosition: !!out.setPosition,
+                                    stoneCount: out.stoneCount || null
                                 })
                             );
                         } catch (error) {

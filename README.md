@@ -6,7 +6,7 @@ Browser-based Go (Weiqi) client backed by a local [KataGo](https://github.com/li
 
 - Play against KataGo in the browser (`go_board.html`)
 - HTTP API wrapping KataGo GTP (`server.js`)
-- Optional board photo recognition via Python (`board_recognizer.py`)
+- Optional board photo recognition via Python (`board_recognizer_gbd.py` / go-board-detect by default; `BOARD_RECOGNIZER=legacy` for `board_recognizer.py`)
 - Windows launch scripts for strong single-game or multi-game GPU use
 
 ## Requirements
@@ -65,7 +65,8 @@ Open `go_board.html` (served by `serve.js` or your API server) and point the UI 
 | `server.js` | KataGo HTTP bridge + recognition |
 | `serve.js` | Lightweight static file server |
 | `gtp_cuda.cfg` | Example strong CUDA GTP config |
-| `board_recognizer.py` | Photo → board position |
+| `board_recognizer_gbd.py` | Photo → board (go-board-detect / moku) |
+| `board_recognizer.py` | Legacy photo → board (Roboflow / CV) |
 | `start_server_*.bat` | Windows launch helpers |
 
 ## License
