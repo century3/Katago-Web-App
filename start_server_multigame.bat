@@ -1,10 +1,10 @@
 @echo off
-REM 16GB 显存 — 更强棋力（1000 visits）+ 最多 2 盘 AI 同时思考
+REM 16GB 显存 — 更强棋力（2000 visits）+ 最多 2 盘 AI 同时思考
 REM 显存紧张或过慢：改 KATAGO_ENGINE_POOL_SIZE=1，或改用 start_server_strong.bat
 set KATAGO_VRAM_GB=16
 set KATAGO_ENGINE_POOL_SIZE=2
 set KATAGO_DEFAULT_MODEL_BASENAME=kata1-zhizi-b40c768nbt-s11272M-d5935M.bin.gz
-set KATAGO_DEFAULT_VISITS=1000
+set KATAGO_DEFAULT_VISITS=2000
 set KATAGO_CFG=gtp_cuda.cfg
 set HTTP_PORT=5001
 cd /d "%~dp0"
