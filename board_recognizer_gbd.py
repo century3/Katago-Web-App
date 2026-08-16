@@ -12,7 +12,7 @@ Katago 棋盘识别后端：调用 go-board-detect（moku-v1 + OpenCV 网格）�
 环境变量：
   GO_BOARD_DETECT_DIR  go-board-detect 仓库根目录
   MOKU_MODEL_DIR       moku-v1 权重目录（含 model.safetensors）
-  BOARD_GBD_CONF       检测置信度，默认 0.05
+  BOARD_GBD_CONF       检测置信度，默认 0.03（白子召回）；误检多可调 0.05~0.08
   BOARD_GBD_DEVICE     cuda:0 / cpu，默认自动
   BOARD_SIZE           9/13/19，默认 19
 """
@@ -167,7 +167,7 @@ def get_runtime():
 
     from moku_infer import MokuDetector
 
-    conf = float(os.environ.get("BOARD_GBD_CONF", "0.05") or "0.05")
+    conf = float(os.environ.get("BOARD_GBD_CONF", "0.03") or "0.03")
     device_env = os.environ.get("BOARD_GBD_DEVICE", "").strip()
     if not device_env:
         try:
@@ -197,7 +197,8 @@ def detect_board_and_stones(image_bytes: bytes, preview_only: bool = False) -> d
     img = downscale_bgr(img)
 
     detector, sgf_mod, gbd_dir = get_runtime()
-    conf = float(os.environ.get("BOARD_GBD_CONF", "0.05") or "0.05")
+    # 手机白子置信度偏低：默认 0.03；误检多可调高 BOARD_GBD_CONF=0.08
+    conf = float(os.environ.get("BOARD_GBD_CONF", "0.03") or "0.03")
     board_size = int(os.environ.get("BOARD_SIZE", "19") or "19")
     if board_size not in (9, 13, 19):
         board_size = 19
@@ -212,6 +213,9 @@ def detect_board_and_stones(image_bytes: bytes, preview_only: bool = False) -> d
         image_name="upload.jpg",
     )
 
+    # 不再做二次纠色：亮度/Otsu 会把高光黑子翻成白。颜色以 moku 检测为准。
+    rescue_meta = {"recolorDisabled": True}
+
     result = {
         "stones": packed["stones"],
         "boardSize": packed["boardSize"],
@@ -221,6 +225,8 @@ def detect_board_and_stones(image_bytes: bytes, preview_only: bool = False) -> d
         "debugSummary": {
             **(packed.get("debugSummary") or {}),
             "gbdDir": str(gbd_dir),
+            "gbdConf": conf,
+            **rescue_meta,
         },
     }
     if packed.get("sgf"):
